@@ -1,0 +1,217 @@
+name: pii-check (reusable)
+
+on:
+  workflow_call:
+    secrets:
+      PII_PATTERNS:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  pii-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load patterns
+        env:
+          PII_PATTERNS: ${{ secrets.PII_PATTERNS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          raw="$RUNNER_TEMP/patterns.raw"
+          pat="$RUNNER_TEMP/patterns"
+          printf '%s\n' "$PII_PATTERNS" > "$raw"
+          grep -v -E '^[[:space:]]*$' "$raw" > "$pat" || true
+          rm -f "$raw"
+          if [ ! -s "$pat" ]; then
+            echo '::error::PII_PATTERNS secret missing or empty'
+            exit 1
+          fi
+          # Validate the pattern list compiles as ERE without echoing it.
+          set +e
+          printf '' | grep -E -f "$pat" >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -gt 1 ]; then
+            echo '::error::PII_PATTERNS is not a valid list of extended regular expressions'
+            exit 1
+          fi
+          echo "pii-check: loaded $(wc -l < "$pat") pattern(s)"
+          echo "PII_PATTERN_FILE=$pat" >> "$GITHUB_ENV"
+
+      - name: Determine range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          head_only() {
+            if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
+              echo "HEAD~1..HEAD"
+            else
+              echo "$(git hash-object -t tree /dev/null)..HEAD"
+            fi
+          }
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            if ! git rev-parse -q --verify "refs/remotes/origin/$BASE_REF" >/dev/null 2>&1; then
+              git fetch --no-tags --quiet origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" || true
+            fi
+            if git rev-parse -q --verify "refs/remotes/origin/$BASE_REF" >/dev/null 2>&1; then
+              RANGE="origin/$BASE_REF...HEAD"
+            else
+              echo "pii-check: base ref unavailable, falling back to HEAD only"
+              RANGE="$(head_only)"
+            fi
+          else
+            case "$BEFORE_SHA" in
+              ""|*[!0]*)
+                if [ -n "$BEFORE_SHA" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+                  RANGE="${BEFORE_SHA}..HEAD"
+                else
+                  echo "pii-check: previous sha unavailable, falling back to HEAD only"
+                  RANGE="$(head_only)"
+                fi
+                ;;
+              *)
+                echo "pii-check: no previous sha (new ref), scanning HEAD only"
+                RANGE="$(head_only)"
+                ;;
+            esac
+          fi
+          echo "pii-check: range $RANGE"
+          echo "PII_RANGE=$RANGE" >> "$GITHUB_ENV"
+
+      - name: Scan
+        run: |
+          set -euo pipefail
+          PATTERNS="$PII_PATTERN_FILE"
+          RANGE="$PII_RANGE"
+          WORK="$RUNNER_TEMP/pii"
+          mkdir -p "$WORK"
+          ALLOW=""
+          if [ -f .pii-allow ] && [ -s .pii-allow ]; then
+            grep -v -E '^[[:space:]]*$' .pii-allow > "$WORK/allow" || true
+            [ -s "$WORK/allow" ] && ALLOW="$WORK/allow"
+            [ -n "$ALLOW" ] && echo "pii-check: .pii-allow active ($(wc -l < "$ALLOW") rule(s))"
+          fi
+
+          pick_delim() {
+            local p="$1" d
+            for d in '#' '%' '~' '!' ',' ';' '=' '<' '>' ':' '_' '@' '/'; do
+              case "$p" in *"$d"*) ;; *) printf '%s' "$d"; return 0 ;; esac
+            done
+            return 1
+          }
+
+          redact() {
+            local line="$1" p d out rc
+            out="$line"
+            while IFS= read -r p; do
+              [ -n "$p" ] || continue
+              if ! d="$(pick_delim "$p")"; then out='[REDACTED LINE]'; break; fi
+              set +e
+              out="$(printf '%s' "$out" | sed -E "s${d}${p}${d}[REDACTED]${d}gI" 2>/dev/null)"
+              rc=$?
+              set -e
+              if [ "$rc" -ne 0 ]; then out='[REDACTED LINE]'; break; fi
+            done < "$PATTERNS"
+            # Belt and braces: never emit anything that still matches a pattern.
+            if printf '%s\n' "$out" | grep -q -E -i -f "$PATTERNS" 2>/dev/null; then
+              out='[REDACTED LINE]'
+            fi
+            if [ "${#out}" -gt 300 ]; then out="${out:0:300}..."; fi
+            printf '%s' "$out"
+          }
+
+          # A range that does not resolve must FAIL, never silently report clean.
+          if ! git rev-list --quiet "$RANGE" -- >/dev/null 2>&1; then
+            echo "::error::pii-check: cannot resolve commit range '$RANGE' - refusing to report clean"
+            exit 1
+          fi
+
+          HITS=0
+
+          scan_stream() {
+            local label="$1" txt="$2" loc="$3" mode="${4:-full}" n content locv
+            [ -s "$txt" ] || return 0
+            set +e
+            local matches
+            matches="$(grep -n -E -i -f "$PATTERNS" "$txt")"
+            local rc=$?
+            set -e
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::pii-check: grep failed while scanning $label"
+              HITS=$((HITS + 1))
+              return 0
+            fi
+            [ -n "$matches" ] || return 0
+            while IFS= read -r m; do
+              [ -n "$m" ] || continue
+              n="${m%%:*}"
+              content="${m#*:}"
+              if [ -n "$ALLOW" ] && printf '%s\n' "$content" | grep -q -E -i -f "$ALLOW" 2>/dev/null; then
+                continue
+              fi
+              locv="$(sed -n "${n}p" "$loc")"
+              if [ "$mode" = "loconly" ]; then
+                printf '  %s %s\n' "$label" "$(redact "$content")"
+              else
+                printf '  %s %s: %s\n' "$label" "$locv" "$(redact "$content")"
+              fi
+              HITS=$((HITS + 1))
+            done <<< "$matches"
+          }
+
+          # (a) added lines in the diff, with file:line
+          if ! git diff "$RANGE" --unified=0 --no-color --diff-filter=ACMR > "$WORK/diff.txt"; then
+            echo "::error::pii-check: git diff failed for range '$RANGE'"
+            exit 1
+          fi
+          awk -v TXT="$WORK/added.txt" -v LOC="$WORK/added.loc" '
+            /^\+\+\+ /{ if ($0 == "+++ /dev/null") { f="" } else { f=substr($0,7) } ; next }
+            /^@@ /{ split($0, a, " "); plus=a[3]; sub(/^\+/, "", plus); split(plus, b, ","); ln=b[1]+0; next }
+            /^\+/{ if (f != "") { print f ":" ln > LOC; print substr($0,2) > TXT; ln++ } next }
+          ' "$WORK/diff.txt"
+          touch "$WORK/added.txt" "$WORK/added.loc"
+          scan_stream "added-line" "$WORK/added.txt" "$WORK/added.loc"
+
+          # (b) commit author metadata and messages
+          : > "$WORK/commits.txt"
+          : > "$WORK/commits.loc"
+          if ! git log "$RANGE" --format='%H' > "$WORK/shas.txt"; then
+            echo "::error::pii-check: git log failed for range '$RANGE'"
+            exit 1
+          fi
+          while IFS= read -r sha; do
+            [ -n "$sha" ] || continue
+            if ! git log -1 --format='%an <%ae>%n%cn <%ce>%n%B' "$sha" > "$WORK/one.txt"; then
+              echo "::error::pii-check: git log failed for commit $sha"
+              exit 1
+            fi
+            while IFS= read -r l; do
+              printf '%s\n' "$l" >> "$WORK/commits.txt"
+              printf '%s\n' "$sha" >> "$WORK/commits.loc"
+            done < "$WORK/one.txt"
+          done < "$WORK/shas.txt"
+          scan_stream "commit" "$WORK/commits.txt" "$WORK/commits.loc"
+
+          # (c) filenames touched by the diff
+          if ! git diff "$RANGE" --name-only --no-color --diff-filter=ACMR > "$WORK/names.txt"; then
+            echo "::error::pii-check: git diff --name-only failed for range '$RANGE'"
+            exit 1
+          fi
+          cp "$WORK/names.txt" "$WORK/names.loc"
+          scan_stream "path" "$WORK/names.txt" "$WORK/names.loc" loconly
+
+          echo
+          if [ "$HITS" -gt 0 ]; then
+            echo "::error::pii-check: $HITS match(es) found. Matched text is redacted above; see file:line / commit sha."
+            exit 1
+          fi
+          echo "pii-check: clean"
