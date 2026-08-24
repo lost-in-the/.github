@@ -7,7 +7,8 @@ pull request and push for content that should never be published, and fails the 
 finds any.
 
 **What it scans**, over the commit range of the event: lines *added* by the diff, commit
-author/committer metadata and commit messages, and the file paths the diff touches.
+messages, and the file paths the diff touches. Author and committer identity are deliberately
+not scanned: a commit is expected to carry a real address, so scanning it only ever fails.
 
 **How it is configured**: the match rules live only in the `PII_PATTERNS` Actions secret,
 one extended regular expression per line. Nothing sensitive is committed to this repo. If the
