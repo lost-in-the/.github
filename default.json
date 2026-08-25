@@ -1,0 +1,8 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Shared Renovate posture for every lost-in-the repo. Reference it with \"extends\": [\"github>lost-in-the/.github\"], which resolves to this file (default.json). Repo-specific packageRules stay in that repo's own renovate.json; only settings that should be identical everywhere belong here. Deliberately no automerge: dependency PRs are reviewed by a human, matching the homelab posture.",
+  "extends": ["config:recommended"],
+  "branchPrefix": "renovate/",
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 5
+}
