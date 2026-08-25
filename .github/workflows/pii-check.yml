@@ -190,7 +190,7 @@ jobs:
           fi
           while IFS= read -r sha; do
             [ -n "$sha" ] || continue
-            if ! git log -1 --format='%an <%ae>%n%cn <%ce>%n%B' "$sha" > "$WORK/one.txt"; then
+            if ! git log -1 --format='%B' "$sha" > "$WORK/one.txt"; then
               echo "::error::pii-check: git log failed for commit $sha"
               exit 1
             fi
