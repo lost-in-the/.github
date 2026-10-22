@@ -6,9 +6,11 @@ Org-wide defaults for `lost-in-the`, including the shared **pii-check** workflow
 pull request and push for content that should never be published, and fails the run when it
 finds any.
 
-**What it scans**, over the commit range of the event: lines *added* by the diff, commit
-messages, and the file paths the diff touches. Author and committer identity are deliberately
-not scanned: a commit is expected to carry a real address, so scanning it only ever fails.
+**What it scans**, over the commit range of the event: lines *added* by the diff, raw author
+and committer names and email addresses, full commit messages (including multiline bodies
+and trailers), and the file paths the diff touches. Identity fields are checked against the
+same secret patterns as content. Configure an appropriate GitHub-provided no-reply address
+for future commits when a personal address would match a prohibited pattern.
 
 **How it is configured**: the match rules live only in the `PII_PATTERNS` Actions secret,
 one extended regular expression per line. Nothing sensitive is committed to this repo. If the
@@ -31,3 +33,10 @@ jobs:
     secrets:
       PII_PATTERNS: ${{ secrets.PII_PATTERNS }}
 ```
+
+## Scanner regression tests
+
+Run `python3 -m unittest discover -s tests -v` with Bash, Git, grep, sed, and awk
+available. The tests execute the reusable workflow's actual shell blocks in disposable
+repositories with synthetic identities and patterns; they do not need Actions secrets
+or access to a consumer repository.
