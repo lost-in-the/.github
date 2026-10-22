@@ -12,6 +12,18 @@ and trailers), and the file paths the diff touches. Identity fields are checked 
 same secret patterns as content. Configure an appropriate GitHub-provided no-reply address
 for future commits when a personal address would match a prohibited pattern.
 
+For pull requests (including `pull_request_target`), the checkout and ranges use the
+event's validated head and base commit SHAs. Commit metadata and messages are scanned
+over `base..head`, including genuine merge commits in the submitted history. Added lines
+and paths use the `base...head` diff from the merge base. GitHub's generated PR merge
+commit and commits reachable only from the base are outside the submitted commit range.
+Missing, malformed, or unavailable PR endpoints, or a missing merge base, fail the run.
+The allow file comes from the submitted head checkout.
+
+Push range selection is unchanged: an available previous commit uses `before..HEAD`;
+new refs and unavailable previous commits retain the existing HEAD-only fallback.
+An initial-commit fallback scans from the empty tree; an unresolvable range fails.
+
 **How it is configured**: the match rules live only in the `PII_PATTERNS` Actions secret,
 one extended regular expression per line. Nothing sensitive is committed to this repo. If the
 secret is missing or empty the run fails loudly rather than passing silently.

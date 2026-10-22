@@ -13,9 +13,28 @@ jobs:
   pii-check:
     runs-on: ubuntu-latest
     steps:
+      - name: Select checkout
+        id: checkout
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target) sha="$PR_HEAD_SHA" ;;
+            *) sha="$EVENT_SHA" ;;
+          esac
+          if [ "${#sha}" -ne 40 ] || [[ "$sha" = *[!0-9a-fA-F]* ]]; then
+            echo '::error::pii-check: missing or invalid event checkout sha'
+            exit 1
+          fi
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ steps.checkout.outputs.sha }}
 
       - name: Load patterns
         env:
@@ -47,7 +66,8 @@ jobs:
       - name: Determine range
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
@@ -59,15 +79,26 @@ jobs:
             fi
           }
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
-            if ! git rev-parse -q --verify "refs/remotes/origin/$BASE_REF" >/dev/null 2>&1; then
-              git fetch --no-tags --quiet origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" || true
+            for sha in "$PR_BASE_SHA" "$PR_HEAD_SHA"; do
+              if [ "${#sha}" -ne 40 ] || [[ "$sha" = *[!0-9a-fA-F]* ]]; then
+                echo '::error::pii-check: missing or invalid pull request commit sha'
+                exit 1
+              fi
+              if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+                if ! git fetch --no-tags --quiet origin "$sha" >/dev/null 2>&1 ||
+                   ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+                  echo '::error::pii-check: pull request commit unavailable'
+                  exit 1
+                fi
+              fi
+            done
+            if ! git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA" >/dev/null 2>&1; then
+              echo '::error::pii-check: pull request merge base unavailable'
+              exit 1
             fi
-            if git rev-parse -q --verify "refs/remotes/origin/$BASE_REF" >/dev/null 2>&1; then
-              RANGE="origin/$BASE_REF...HEAD"
-            else
-              echo "pii-check: base ref unavailable, falling back to HEAD only"
-              RANGE="$(head_only)"
-            fi
+            # Diff the submitted tree from its merge base; scan only submitted commits.
+            RANGE="${PR_BASE_SHA}...${PR_HEAD_SHA}"
+            COMMIT_RANGE="${PR_BASE_SHA}..${PR_HEAD_SHA}"
           else
             case "$BEFORE_SHA" in
               ""|*[!0]*)
@@ -83,15 +114,18 @@ jobs:
                 RANGE="$(head_only)"
                 ;;
             esac
+            COMMIT_RANGE="$RANGE"
           fi
           echo "pii-check: range $RANGE"
           echo "PII_RANGE=$RANGE" >> "$GITHUB_ENV"
+          echo "PII_COMMIT_RANGE=$COMMIT_RANGE" >> "$GITHUB_ENV"
 
       - name: Scan
         run: |
           set -euo pipefail
           PATTERNS="$PII_PATTERN_FILE"
           RANGE="$PII_RANGE"
+          COMMIT_RANGE="${PII_COMMIT_RANGE:-$RANGE}"
           WORK="$RUNNER_TEMP/pii"
           mkdir -p "$WORK"
           ALLOW=""
@@ -130,10 +164,12 @@ jobs:
           }
 
           # A range that does not resolve must FAIL, never silently report clean.
-          if ! git rev-list --quiet "$RANGE" -- >/dev/null 2>&1; then
-            echo "::error::pii-check: cannot resolve commit range '$RANGE' - refusing to report clean"
-            exit 1
-          fi
+          for scan_range in "$RANGE" "$COMMIT_RANGE"; do
+            if ! git rev-list --quiet "$scan_range" -- >/dev/null 2>&1; then
+              echo "::error::pii-check: cannot resolve commit range '$scan_range' - refusing to report clean"
+              exit 1
+            fi
+          done
 
           HITS=0
 
@@ -162,6 +198,10 @@ jobs:
               if [ "$mode" = "loconly" ]; then
                 printf '  %s %s\n' "$label" "$(redact "$content")"
               else
+                if [ "$label" = "added-line" ]; then
+                  locv="$(redact "${locv%:*}"):${locv##*:}"
+                fi
+                locv="$(redact "$locv")"
                 printf '  %s %s: %s\n' "$label" "$locv" "$(redact "$content")"
               fi
               HITS=$((HITS + 1))
@@ -184,8 +224,8 @@ jobs:
           # (b) raw author/committer names and emails, then full commit messages
           : > "$WORK/commits.txt"
           : > "$WORK/commits.loc"
-          if ! git log "$RANGE" --format='%H' > "$WORK/shas.txt"; then
-            echo "::error::pii-check: git log failed for range '$RANGE'"
+          if ! git log "$COMMIT_RANGE" --format='%H' > "$WORK/shas.txt"; then
+            echo "::error::pii-check: git log failed for range '$COMMIT_RANGE'"
             exit 1
           fi
           while IFS= read -r sha; do
