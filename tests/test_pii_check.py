@@ -349,7 +349,7 @@ class ScannerTest(unittest.TestCase):
     def test_checkout_selection_uses_validated_event_sha(self):
         head = self.commit()
         for event, expected in [('pull_request', self.base),
-                                ('pull_request_target', self.base), ('push', head)]:
+                                ('pull_request_target', head), ('push', head)]:
             with self.subTest(event=event):
                 result = self.run_step('Select checkout', EVENT_NAME=event,
                                        PR_HEAD_SHA=self.base, EVENT_SHA=head)
@@ -382,6 +382,38 @@ class ScannerTest(unittest.TestCase):
         result = self.selected_scan()
         self.assertEqual(0, result.returncode, result.stdout)
         self.assertIn('.pii-allow active', result.stdout)
+
+    def test_target_event_does_not_trust_submitted_allow_file(self):
+        self.git('checkout', '-q', '-b', 'submitted')
+        (self.repo / '.pii-allow').write_text('SYNTHETIC_PII_.*\n')
+        (self.repo / 'submitted.txt').write_text(MARKER + '\n')
+        self.git('add', '.')
+        head = self.commit('Synthetic submitted violation', GIT_AUTHOR_NAME=MARKER,
+                           GIT_AUTHOR_EMAIL=MARKER + '@example.invalid',
+                           GIT_COMMITTER_NAME=MARKER,
+                           GIT_COMMITTER_EMAIL=MARKER + '@example.invalid')
+        result = self.run_step('Select checkout', EVENT_NAME='pull_request_target',
+                               PR_HEAD_SHA=head, EVENT_SHA=self.base)
+        self.assertEqual(0, result.returncode, result.stdout)
+        chosen = Path(self.env['GITHUB_OUTPUT']).read_text().strip().split('=', 1)[1]
+        self.git('checkout', '-q', '--detach', chosen)
+        result = self.determine_pr(self.base, head, 'pull_request_target')
+        self.assertEqual(0, result.returncode, result.stdout)
+        result = self.selected_scan()
+        self.assert_hit(result, 'commit', sha=head)
+        self.assertIn('added-line', result.stdout)
+        self.assertNotIn('.pii-allow active', result.stdout)
+        self.assertFalse((self.repo / '.pii-allow').exists())
+        self.assertEqual(self.base, self.git('rev-parse', 'HEAD'))
+
+    def test_target_checkout_rejects_invalid_trusted_event_sha(self):
+        head = self.commit()
+        for invalid in ('', '--all', head + '\nextra', 'g' * 40):
+            with self.subTest(invalid_length=len(invalid)):
+                result = self.run_step('Select checkout', EVENT_NAME='pull_request_target',
+                                       PR_HEAD_SHA=head, EVENT_SHA=invalid)
+                self.assertEqual(1, result.returncode, result.stdout)
+                self.assertFalse(Path(self.env['GITHUB_OUTPUT']).exists())
 
     def test_pr_missing_commit_can_be_fetched_by_validated_sha(self):
         remote = self.root / 'remote.git'

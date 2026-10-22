@@ -22,7 +22,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            pull_request|pull_request_target) sha="$PR_HEAD_SHA" ;;
+            pull_request) sha="$PR_HEAD_SHA" ;;
+            # Target events retain their trusted base checkout and allow file.
             *) sha="$EVENT_SHA" ;;
           esac
           if [ "${#sha}" -ne 40 ] || [[ "$sha" = *[!0-9a-fA-F]* ]]; then
