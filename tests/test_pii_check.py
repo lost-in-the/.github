@@ -75,14 +75,18 @@ class ScannerTest(unittest.TestCase):
         if sha:
             self.assertIn(sha, result.stdout)
 
-    def test_identity_fields(self):
+    # Author and committer identity is expected to be the owner's own; only
+    # commit messages are scanned for commit metadata.
+    def test_identity_fields_are_not_scanned(self):
         for field in ('GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',
                       'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'):
             with self.subTest(field=field):
                 before = self.git('rev-parse', 'HEAD')
                 value = MARKER if field.endswith('NAME') else MARKER + '@example.invalid'
-                sha = self.commit(**{field: value})
-                self.assert_hit(self.scan(before + '..HEAD'), sha=sha)
+                self.commit(**{field: value})
+                result = self.scan(before + '..HEAD')
+                self.assertEqual(0, result.returncode, result.stdout)
+                self.assertIn('pii-check: clean', result.stdout)
 
     def test_multiline_message_and_trailer(self):
         for message in ('Safe subject\n\nSafe body\n' + MARKER + '\nLast line',
@@ -92,14 +96,8 @@ class ScannerTest(unittest.TestCase):
                 sha = self.commit(message)
                 self.assert_hit(self.scan(before + '..HEAD'), sha=sha)
 
-    def test_case_insensitive_identity(self):
-        self.commit(GIT_AUTHOR_NAME=MARKER.lower())
-        self.assert_hit(self.scan())
-
-    def test_raw_identity_is_not_hidden_by_mailmap(self):
-        (self.repo / '.mailmap').write_text(
-            'Safe <safe@example.invalid> Synthetic Author <' + MARKER + '@example.invalid>\n')
-        self.commit(GIT_AUTHOR_EMAIL=MARKER + '@example.invalid')
+    def test_case_insensitive_message(self):
+        self.commit(MARKER.lower())
         self.assert_hit(self.scan())
 
     def test_safe_noreply_and_multiline_message(self):
@@ -112,21 +110,21 @@ class ScannerTest(unittest.TestCase):
 
     def test_merge_traversal_includes_side_branch(self):
         self.git('checkout', '-q', '-b', 'side')
-        sha = self.commit(GIT_COMMITTER_NAME=MARKER)
+        sha = self.commit(MARKER)
         self.git('checkout', '-q', 'main')
         self.commit()
         self.git('merge', '-q', '--no-ff', 'side', '-m', 'Synthetic merge')
         self.assert_hit(self.scan(), sha=sha)
 
     def test_push_range_excludes_old_metadata(self):
-        before = self.commit(GIT_AUTHOR_NAME=MARKER)
+        before = self.commit(MARKER)
         self.commit()
         result = self.scan(before + '..HEAD')
         self.assertEqual(0, result.returncode, result.stdout)
 
     def test_pr_range_includes_branch_metadata(self):
         self.git('update-ref', 'refs/remotes/origin/main', self.base)
-        self.commit(GIT_COMMITTER_EMAIL=MARKER + '@example.invalid')
+        self.commit(MARKER)
         self.assert_hit(self.scan('origin/main...HEAD'))
 
     def test_added_line_and_path_are_redacted(self):
@@ -261,8 +259,7 @@ class ScannerTest(unittest.TestCase):
         self.git('checkout', '-q', 'main')
         self.commit('Synthetic base-only commit')
         base = self.git('rev-parse', 'HEAD')
-        self.git('merge', '-q', '--no-ff', 'submitted', '-m', 'Synthetic generated merge',
-                 env={'GIT_COMMITTER_EMAIL': MARKER + '@example.invalid'})
+        self.git('merge', '-q', '--no-ff', 'submitted', '-m', 'Synthetic generated merge ' + MARKER)
         generated = self.git('rev-parse', 'HEAD')
         self.assert_hit(self.scan(base + '...HEAD'), sha=generated)
         for event in ('pull_request', 'pull_request_target'):
@@ -273,24 +270,19 @@ class ScannerTest(unittest.TestCase):
                 self.assertEqual(0, result.returncode, result.stdout)
                 self.assertNotIn(generated, result.stdout)
 
-    def test_pr_checks_all_submitted_identity_fields(self):
+    def test_pr_checks_submitted_message(self):
         self.git('checkout', '-q', '-b', 'submitted')
-        for field in ('GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',
-                      'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'):
-            with self.subTest(field=field):
-                base = self.git('rev-parse', 'HEAD')
-                head = self.commit(**{field: MARKER})
-                result = self.determine_pr(base, head)
-                self.assertEqual(0, result.returncode, result.stdout)
-                self.assert_hit(self.selected_scan(), sha=head)
+        head = self.commit(MARKER)
+        result = self.determine_pr(self.base, head)
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assert_hit(self.selected_scan(), sha=head)
 
     def test_pr_genuine_merge_and_side_commit_are_scanned(self):
         self.git('checkout', '-q', '-b', 'side')
-        side = self.commit(GIT_AUTHOR_EMAIL=MARKER + '@example.invalid')
+        side = self.commit(MARKER)
         self.git('checkout', '-q', 'main')
         self.commit()
-        self.git('merge', '-q', '--no-ff', 'side', '-m', 'Synthetic submitted merge',
-                 env={'GIT_COMMITTER_NAME': MARKER})
+        self.git('merge', '-q', '--no-ff', 'side', '-m', 'Synthetic submitted merge ' + MARKER)
         head = self.git('rev-parse', 'HEAD')
         result = self.determine_pr(self.base, head)
         self.assertEqual(0, result.returncode, result.stdout)
@@ -302,7 +294,7 @@ class ScannerTest(unittest.TestCase):
         self.git('checkout', '-q', '-b', 'submitted')
         head = self.commit()
         self.git('checkout', '-q', 'main')
-        base = self.commit(GIT_AUTHOR_NAME=MARKER)
+        base = self.commit(MARKER)
         result = self.determine_pr(base, head)
         self.assertEqual(0, result.returncode, result.stdout)
         result = self.selected_scan()
@@ -388,10 +380,7 @@ class ScannerTest(unittest.TestCase):
         (self.repo / '.pii-allow').write_text('SYNTHETIC_PII_.*\n')
         (self.repo / 'submitted.txt').write_text(MARKER + '\n')
         self.git('add', '.')
-        head = self.commit('Synthetic submitted violation', GIT_AUTHOR_NAME=MARKER,
-                           GIT_AUTHOR_EMAIL=MARKER + '@example.invalid',
-                           GIT_COMMITTER_NAME=MARKER,
-                           GIT_COMMITTER_EMAIL=MARKER + '@example.invalid')
+        head = self.commit('Synthetic submitted violation ' + MARKER)
         result = self.run_step('Select checkout', EVENT_NAME='pull_request_target',
                                PR_HEAD_SHA=head, EVENT_SHA=self.base)
         self.assertEqual(0, result.returncode, result.stdout)
@@ -422,7 +411,7 @@ class ScannerTest(unittest.TestCase):
         self.git('clone', '-q', str(remote), str(contributor))
         self.git('-C', str(contributor), 'config', 'commit.gpgsign', 'false')
         self.git('-C', str(contributor), 'commit', '-q', '--allow-empty',
-                 '-m', 'Synthetic remote head', env={'GIT_AUTHOR_NAME': MARKER})
+                 '-m', 'Synthetic remote head ' + MARKER)
         head = self.git('-C', str(contributor), 'rev-parse', 'HEAD')
         self.git('-C', str(contributor), 'push', '-q', 'origin', 'HEAD:refs/heads/submitted')
         self.git('remote', 'add', 'origin', str(remote))
@@ -434,7 +423,7 @@ class ScannerTest(unittest.TestCase):
         self.assert_hit(self.selected_scan(), sha=head)
 
     def test_new_branch_and_missing_previous_sha_keep_head_only_policy(self):
-        self.commit(GIT_AUTHOR_NAME=MARKER)
+        self.commit(MARKER)
         self.commit('Synthetic clean tip')
         for before in ('0' * 40, '', 'f' * 40):
             with self.subTest(before=before):
@@ -446,7 +435,7 @@ class ScannerTest(unittest.TestCase):
 
     def test_initial_push_fallback_cannot_hide_root_metadata(self):
         self.git('checkout', '-q', '--orphan', 'synthetic-root')
-        head = self.commit('Synthetic root metadata', GIT_AUTHOR_NAME=MARKER)
+        head = self.commit('Synthetic root metadata ' + MARKER)
         result = self.run_step('Determine range', EVENT_NAME='push', BEFORE_SHA='',
                                PR_BASE_SHA='', PR_HEAD_SHA='')
         self.assertEqual(0, result.returncode, result.stdout)
