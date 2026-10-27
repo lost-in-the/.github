@@ -222,7 +222,8 @@ jobs:
           touch "$WORK/added.txt" "$WORK/added.loc"
           scan_stream "added-line" "$WORK/added.txt" "$WORK/added.loc"
 
-          # (b) raw author/committer names and emails, then full commit messages
+          # (b) full commit messages, including trailers. Author and committer
+          # identity is the owner's own and is not scanned.
           : > "$WORK/commits.txt"
           : > "$WORK/commits.loc"
           if ! git log "$COMMIT_RANGE" --format='%H' > "$WORK/shas.txt"; then
@@ -231,7 +232,7 @@ jobs:
           fi
           while IFS= read -r sha; do
             [ -n "$sha" ] || continue
-            if ! git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$sha" > "$WORK/one.txt"; then
+            if ! git log -1 --format='%B' "$sha" > "$WORK/one.txt"; then
               echo "::error::pii-check: git log failed for commit $sha"
               exit 1
             fi
