@@ -6,14 +6,14 @@ Org-wide defaults for `lost-in-the`, including the shared **pii-check** workflow
 pull request and push for content that should never be published, and fails the run when it
 finds any.
 
-**What it scans**, over the commit range of the event: lines *added* by the diff, raw author
-and committer names and email addresses, full commit messages (including multiline bodies
-and trailers), and the file paths the diff touches. Identity fields are checked against the
-same secret patterns as content. Configure an appropriate GitHub-provided no-reply address
-for future commits when a personal address would match a prohibited pattern.
+**What it scans**, over the commit range of the event: lines *added* by the diff, full commit
+messages (including multiline bodies and trailers), and the file paths the diff touches.
+Author and committer names and email addresses are not scanned: commits made as the owner
+are expected to carry the owner's identity. A `Co-authored-by` trailer is part of the
+message, so it is still scanned.
 
 For pull requests (including `pull_request_target`), ranges use the event's validated
-head and base commit SHAs. Commit metadata and messages are scanned
+head and base commit SHAs. Commit messages are scanned
 over `base..head`, including genuine merge commits in the submitted history. Added lines
 and paths use the `base...head` diff from the merge base. GitHub's generated PR merge
 commit and commits reachable only from the base are outside the submitted commit range.
