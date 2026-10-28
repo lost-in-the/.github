@@ -1,4 +1,5 @@
 """Exercise the reusable workflow's actual shell blocks using synthetic Git data."""
+import base64
 import os
 from pathlib import Path
 import shutil
@@ -404,7 +405,7 @@ class ScannerTest(unittest.TestCase):
                 self.assertEqual(1, result.returncode, result.stdout)
                 self.assertFalse(Path(self.env['GITHUB_OUTPUT']).exists())
 
-    def test_pr_missing_commit_can_be_fetched_by_validated_sha(self):
+    def remote_head(self):
         remote = self.root / 'remote.git'
         contributor = self.root / 'contributor'
         self.git('clone', '-q', '--bare', str(self.repo), str(remote))
@@ -418,8 +419,42 @@ class ScannerTest(unittest.TestCase):
         missing = subprocess.run(['git', 'cat-file', '-e', head + '^{commit}'],
                                  cwd=self.repo, env=self.env, capture_output=True)
         self.assertNotEqual(0, missing.returncode)
+        return head
+
+    def test_pr_missing_commit_can_be_fetched_by_validated_sha(self):
+        head = self.remote_head()
         result = self.determine_pr(self.base, head)
         self.assertEqual(0, result.returncode, result.stdout)
+        self.assert_hit(self.selected_scan(), sha=head)
+
+    def test_private_endpoint_fetch_auth_is_command_scoped_and_not_logged(self):
+        head = self.remote_head()
+        wrappers = self.root / 'auth-bin'
+        wrappers.mkdir()
+        wrapper = wrappers / 'git'
+        wrapper.write_text(
+            '#!/bin/bash\n'
+            'if [ "$1" = fetch ]; then\n'
+            '  [ "${GIT_CONFIG_COUNT:-}" = 1 ] || exit 77\n'
+            '  [ "${GIT_CONFIG_KEY_0:-}" = http.https://github.com/.extraheader ] || exit 77\n'
+            '  [ "${GIT_CONFIG_VALUE_0:-}" = "$EXPECTED_AUTH" ] || exit 77\n'
+            'fi\nexec "$REAL_GIT" "$@"\n')
+        wrapper.chmod(0o755)
+        token = 'synthetic-read-token'
+        encoded = base64.b64encode(('x-access-token:' + token).encode()).decode()
+        env = dict(EVENT_NAME='pull_request_target', PR_BASE_SHA=self.base,
+                   PR_HEAD_SHA=head, PATH=str(wrappers) + os.pathsep + self.env['PATH'],
+                   REAL_GIT=shutil.which('git'), EXPECTED_AUTH='AUTHORIZATION: basic ' + encoded)
+        refused = self.run_step('Determine range', GH_READ_TOKEN='', **env)
+        self.assertEqual(1, refused.returncode, refused.stdout)
+        result = self.run_step('Determine range', GH_READ_TOKEN=token, **env)
+        self.assertEqual(0, result.returncode, result.stdout)
+        for value in (token, encoded):
+            self.assertNotIn(value, result.stdout)
+        persisted = subprocess.run(['git', 'config', '--local', '--get-regexp',
+                                    r'^http\..*\.extraheader$'], cwd=self.repo,
+                                   env=self.env, capture_output=True)
+        self.assertEqual(1, persisted.returncode)
         self.assert_hit(self.selected_scan(), sha=head)
 
     def test_new_branch_and_missing_previous_sha_keep_head_only_policy(self):

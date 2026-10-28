@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   pii-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Select checkout
         id: checkout
@@ -32,10 +32,11 @@ jobs:
           fi
           printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node 24
         with:
           fetch-depth: 0
           ref: ${{ steps.checkout.outputs.sha }}
+          persist-credentials: false
 
       - name: Load patterns
         env:
@@ -66,12 +67,27 @@ jobs:
 
       - name: Determine range
         env:
+          GH_READ_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          fetch_commit() {
+            # Checkout credentials are not persisted. Only this trusted Git
+            # read receives authentication when a private PR endpoint is absent.
+            if [ -n "${GH_READ_TOKEN:-}" ]; then
+              local authorization
+              authorization="$(printf 'x-access-token:%s' "$GH_READ_TOKEN" | base64 | tr -d '\n')"
+              GIT_CONFIG_COUNT=1 \
+                GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+                GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization" \
+                git fetch --no-tags --quiet origin "$1" >/dev/null 2>&1
+            else
+              git fetch --no-tags --quiet origin "$1" >/dev/null 2>&1
+            fi
+          }
           head_only() {
             if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
               echo "HEAD~1..HEAD"
@@ -86,7 +102,7 @@ jobs:
                 exit 1
               fi
               if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
-                if ! git fetch --no-tags --quiet origin "$sha" >/dev/null 2>&1 ||
+                if ! fetch_commit "$sha" ||
                    ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
                   echo '::error::pii-check: pull request commit unavailable'
                   exit 1
